@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { createLogger, format, transports, Logger } from 'winston';
-import { RequestContextStorage } from '../context/request-context';
+import { RequestContextStorage } from '../request-context';
 
 @Injectable()
 export class AppLogger {
@@ -14,9 +14,7 @@ export class AppLogger {
         format.errors({ stack: true }),
         format.json(),
       ),
-      transports: [
-        new transports.Console(),
-      ],
+      transports: [new transports.Console()],
     });
   }
 

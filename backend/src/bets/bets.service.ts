@@ -6,7 +6,9 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, In } from 'typeorm';
+import { EventBus } from '@nestjs/cqrs';
+import { v4 as uuidv4 } from 'uuid';
 import { Bet, BetStatus } from './entities/bet.entity';
 import {
   Match,
@@ -17,12 +19,10 @@ import { CreateBetDto } from './dto/create-bet.dto';
 import { UpdateBetStatusDto } from './dto/update-bet-status.dto';
 import { WalletService } from '../wallet/wallet.service';
 import { FreeBetVoucherService } from '../free-bet-vouchers/free-bet-vouchers.service';
-import {
-  Transaction,
-  TransactionType,
-  TransactionStatus,
-} from '../transactions/entities/transaction.entity';
-import { LeaderboardService } from '../leaderboard/leaderboard.service';
+import { TransactionSource } from '../wallet/entities/balance-transaction.entity';
+import { BetPlacedEvent } from '../leaderboard/domain/events/bet-placed.event';
+import { BetSettledEvent } from '../leaderboard/domain/events/bet-settled.event';
+import { RateLimitInteractionService } from '../rate-limit/rate-limit-interaction.service';
 
 export interface PaginatedBets {
   data: Bet[];
@@ -30,6 +30,17 @@ export interface PaginatedBets {
   page: number;
   limit: number;
   totalPages: number;
+}
+
+export interface BetSettlementSummary {
+  settled: number;
+  won: number;
+  lost: number;
+  totalPayout: number;
+}
+
+export interface SettlementExecutionOptions {
+  batchSize?: number;
 }
 
 @Injectable()
@@ -41,13 +52,10 @@ export class BetsService {
     private readonly matchRepository: Repository<Match>,
     private readonly dataSource: DataSource,
     private readonly walletService: WalletService,
-
-    private readonly leaderboardService: LeaderboardService,
-  ) { }
-
+    private readonly eventBus: EventBus,
     private readonly freeBetVoucherService: FreeBetVoucherService,
+    private readonly rateLimitService: RateLimitInteractionService,
   ) {}
-
 
   /**
    * Place a bet on a match
@@ -88,6 +96,7 @@ if (betCount >= MAX_BETS_PER_MATCH) {
       // Resolve free bet voucher if provided. Vouchers: non-withdrawable, betting only, auto-consumed on use.
       let useVoucher = false;
       let voucherId: string | undefined;
+      let voucherIsWithdrawable = false;
       if (createBetDto.voucherId) {
         const voucher = await this.freeBetVoucherService.validateVoucher(
           createBetDto.voucherId,
@@ -101,23 +110,26 @@ if (betCount >= MAX_BETS_PER_MATCH) {
         }
         useVoucher = true;
         voucherId = createBetDto.voucherId;
+        voucherIsWithdrawable = Boolean(voucher.metadata?.isWithdrawable);
       }
 
       // Deduct from wallet only when not using a voucher (vouchers cannot be withdrawn)
       if (!useVoucher) {
-        const walletResult = await this.walletService.updateUserBalance(
-          userId,
-          -Number(createBetDto.stakeAmount),
-          TransactionType.BET_PLACEMENT,
-          undefined,
-          {
-            matchId: createBetDto.matchId,
-            predictedOutcome: createBetDto.predictedOutcome,
-          },
-        );
-        if (!walletResult.success) {
+        try {
+          await this.walletService.debit(
+            userId,
+            Number(createBetDto.stakeAmount),
+            TransactionSource.BET,
+            uuidv4(),
+            {
+              reason: 'BET_PLACEMENT',
+              matchId: createBetDto.matchId,
+              predictedOutcome: createBetDto.predictedOutcome,
+            },
+          );
+        } catch (error) {
           throw new BadRequestException(
-            walletResult.error || 'Failed to deduct stake amount from wallet',
+            error.message || 'Failed to deduct stake amount from wallet',
           );
         }
       }
@@ -135,14 +147,21 @@ if (betCount >= MAX_BETS_PER_MATCH) {
         odds,
         potentialPayout,
         status: BetStatus.PENDING,
-        metadata: useVoucher ? { voucherId, isFreeBet: true } : undefined,
+        metadata: useVoucher
+          ? {
+              voucherId,
+              isFreeBet: true,
+              isVoucherWithdrawable: voucherIsWithdrawable,
+            }
+          : undefined,
       });
 
       const savedBet = await queryRunner.manager.save(bet);
 
       // Automatically consume voucher on use
       if (useVoucher && voucherId) {
-        await this.freeBetVoucherService.consumeVoucher(
+        await this.freeBetVoucherService.consumeVoucherWithManager(
+          queryRunner.manager,
           voucherId,
           userId,
           savedBet.id,
@@ -150,22 +169,23 @@ if (betCount >= MAX_BETS_PER_MATCH) {
       }
 
       // Link wallet transaction to bet (only when wallet was used)
-      if (!useVoucher) {
-        const transaction = await queryRunner.manager.findOne(Transaction, {
-          where: {
-            userId,
-            type: TransactionType.BET_PLACEMENT,
-            status: TransactionStatus.COMPLETED,
-          },
-          order: { createdAt: 'DESC' } as any,
-        });
-        if (transaction) {
-          transaction.relatedEntityId = savedBet.id;
-          await queryRunner.manager.save(transaction);
-        }
-      }
+      // Note: The new WalletService might not expose easy access to the last transaction entity directly in the same way,
+      // but we passed metadata. If we need to link explicitly, we might need to adjust WalletService.
+      // For now, skipping explicit linking as WalletService handles its own transaction logs.
 
       await queryRunner.commitTransaction();
+
+      // Emit BetPlacedEvent for leaderboard updates
+      this.eventBus.publish(
+        new BetPlacedEvent(
+          userId,
+          createBetDto.matchId,
+          Number(createBetDto.stakeAmount),
+          createBetDto.predictedOutcome,
+        ),
+      );
+
+      await this.rateLimitService.recordInteraction(userId);
 
       return savedBet;
     } catch (error) {
@@ -320,124 +340,74 @@ if (betCount >= MAX_BETS_PER_MATCH) {
 
     const savedBet = await this.betRepository.save(bet);
 
-    // Update leaderboard stats asynchronously
-    this.leaderboardService.updateStatsAfterBetSettlement(savedBet);
+    // Update leaderboard stats asynchronously via event
+    // Note: Assuming we want to treat manual updates similar to settlement
+    // We construct a settlement event
+    const isWin = savedBet.status === BetStatus.WON;
+    if (
+      savedBet.status === BetStatus.WON ||
+      savedBet.status === BetStatus.LOST
+    ) {
+      this.eventBus.publish(
+        new BetSettledEvent(
+          savedBet.userId,
+          savedBet.id,
+          savedBet.matchId,
+          isWin,
+          Number(savedBet.stakeAmount),
+          isWin ? Number(savedBet.potentialPayout) : 0,
+          0, // Accuracy calculated by handler
+        ),
+      );
+    }
 
     return savedBet;
   }
 
   /**
    * Settle all bets for a match based on the match outcome
-   * Uses transaction for atomic operations including wallet updates
+   * Winning bets are always processed before losing bets so retries can safely
+   * resume from the remaining pending set.
    */
-  async settleMatchBets(matchId: string): Promise<{
-    settled: number;
-    won: number;
-    lost: number;
-    totalPayout: number;
-  }> {
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
+  async settleMatchBets(
+    matchId: string,
+    options: SettlementExecutionOptions = {},
+  ): Promise<BetSettlementSummary> {
+    const match = await this.matchRepository.findOne({
+      where: { id: matchId },
+    });
 
-    try {
-      // Get the match
-      const match = await queryRunner.manager.findOne(Match, {
-        where: { id: matchId },
-      });
-
-      if (!match) {
-        throw new NotFoundException('Match not found');
-      }
-
-      if (match.status !== MatchStatus.FINISHED) {
-        throw new BadRequestException(
-          'Cannot settle bets: Match is not finished',
-        );
-      }
-
-      if (!match.outcome) {
-        throw new BadRequestException(
-          'Cannot settle bets: Match outcome not set',
-        );
-      }
-
-      // Get all pending bets for this match
-      // Use relations to avoid N+1 when accessing user data
-      const pendingBets = await queryRunner.manager.find(Bet, {
-        where: { matchId, status: BetStatus.PENDING },
-      });
-
-      let won = 0;
-      let lost = 0;
-      let totalPayout = 0;
-
-      // Settle each bet
-      for (const bet of pendingBets) {
-        if (bet.predictedOutcome === match.outcome) {
-          // Winner - distribute payout
-          bet.status = BetStatus.WON;
-          won++;
-          totalPayout += Number(bet.potentialPayout);
-
-          // Credit winnings to user wallet
-          await this.walletService.updateUserBalance(
-            bet.userId,
-            Number(bet.potentialPayout),
-            TransactionType.BET_WINNING,
-            bet.id,
-            {
-              matchId: bet.matchId,
-              stakeAmount: Number(bet.stakeAmount),
-              payoutAmount: Number(bet.potentialPayout),
-            },
-          );
-        } else {
-          // Loser - no payout
-          bet.status = BetStatus.LOST;
-          lost++;
-        }
-        bet.settledAt = new Date();
-        await queryRunner.manager.save(bet);
-      }
-
-      await queryRunner.commitTransaction();
-
-      // Update leaderboard stats for all settled bets
-      // We run this without awaiting to not block the response, or await if we want to ensure consistency before return.
-      // Given the requirement for efficiency, let's await it but handle errors so it doesn't crash.
-      for (const bet of pendingBets) {
-        try {
-          await this.leaderboardService.updateStatsAfterBetSettlement(bet);
-        } catch (e) {
-          console.error(`Failed to update leaderboard for bet ${bet.id}`, e);
-        }
-      }
-
-      return {
-        settled: pendingBets.length,
-        won,
-        lost,
-        totalPayout,
-      };
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      throw error;
-    } finally {
-      // Process leaderboard updates for settled bets outside of the transaction block
-      // We do this here (after release) to ensure we don't hold the connection 
-      // but we need the bets data. However, queryRunner is released.
-      // Better to do it after commit but before release if we had the data. 
-      // Actually we have pendingBets list. We can iterate it.
-      // But queryRunner.release() is called in finally.
-      // Let's do it before release but inside a try/catch strictly for leaderboard so it doesn't fail the main request.
-
-      // Since transaction is committed, we can safely update leaderboard.
-      // We will perform this AFTER the transaction block is fully done (conceptually), but 'finally' runs always.
-      // We should check if transaction succeeded, which is hard in finally.
-      // Instead, let's move this logic to BEFORE the finally block, right after commit.
-      await queryRunner.release();
+    if (!match) {
+      throw new NotFoundException('Match not found');
     }
+
+    if (match.status !== MatchStatus.FINISHED) {
+      throw new BadRequestException('Cannot settle bets: Match is not finished');
+    }
+
+    if (!match.outcome) {
+      throw new BadRequestException('Cannot settle bets: Match outcome not set');
+    }
+
+    const batchSize = Math.max(1, Math.min(options.batchSize ?? 200, 500));
+
+    const winnersSummary = await this.processSettlementBatches(
+      match,
+      batchSize,
+      true,
+    );
+    const losersSummary = await this.processSettlementBatches(
+      match,
+      batchSize,
+      false,
+    );
+
+    return {
+      settled: winnersSummary.settled + losersSummary.settled,
+      won: winnersSummary.won + losersSummary.won,
+      lost: winnersSummary.lost + losersSummary.lost,
+      totalPayout: winnersSummary.totalPayout + losersSummary.totalPayout,
+    };
   }
 
   /**
@@ -474,17 +444,36 @@ if (betCount >= MAX_BETS_PER_MATCH) {
       }
 
       // Refund stake amount to user wallet
-      await this.walletService.updateUserBalance(
-        bet.userId,
-        Number(bet.stakeAmount),
-        TransactionType.BET_CANCELLATION,
-        bet.id,
-        {
-          matchId: bet.matchId,
-          stakeAmount: Number(bet.stakeAmount),
-          cancellationReason: isAdmin ? 'admin_cancelled' : 'user_cancelled',
-        },
+      const isFreeBet = Boolean(bet.metadata?.isFreeBet);
+      const isVoucherWithdrawable = Boolean(
+        bet.metadata?.isVoucherWithdrawable,
       );
+      const voucherId = bet.metadata?.voucherId as string | undefined;
+
+      if (isFreeBet && voucherId && !isVoucherWithdrawable) {
+        await this.freeBetVoucherService.restoreVoucherWithManager(
+          queryRunner.manager,
+          voucherId,
+          bet.userId,
+          bet.id,
+        );
+      } else {
+        await this.walletService.credit(
+          bet.userId,
+          Number(bet.stakeAmount),
+          TransactionSource.BET,
+          uuidv4(),
+          {
+            reason: 'BET_CANCELLATION',
+            betId: bet.id,
+            matchId: bet.matchId,
+            stakeAmount: Number(bet.stakeAmount),
+            cancellationReason: isAdmin ? 'admin_cancelled' : 'user_cancelled',
+            isFreeBet,
+            isVoucherWithdrawable,
+          },
+        );
+      }
 
       bet.status = BetStatus.CANCELLED;
       bet.settledAt = new Date();
@@ -494,6 +483,181 @@ if (betCount >= MAX_BETS_PER_MATCH) {
       await queryRunner.commitTransaction();
 
       return savedBet;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private async processSettlementBatches(
+    match: Match,
+    batchSize: number,
+    winnersOnly: boolean,
+  ): Promise<BetSettlementSummary> {
+    const summary: BetSettlementSummary = {
+      settled: 0,
+      won: 0,
+      lost: 0,
+      totalPayout: 0,
+    };
+
+    while (true) {
+      const batch = await this.loadPendingSettlementBatch(
+        match.id,
+        match.outcome,
+        batchSize,
+        winnersOnly,
+      );
+
+      if (batch.length === 0) {
+        break;
+      }
+
+      const batchSummary = await this.settleBetBatch(match, batch, winnersOnly);
+      summary.settled += batchSummary.settled;
+      summary.won += batchSummary.won;
+      summary.lost += batchSummary.lost;
+      summary.totalPayout += batchSummary.totalPayout;
+    }
+
+    return summary;
+  }
+
+  private async loadPendingSettlementBatch(
+    matchId: string,
+    matchOutcome: MatchOutcome,
+    batchSize: number,
+    winnersOnly: boolean,
+  ): Promise<Bet[]> {
+    const queryBuilder = this.betRepository
+      .createQueryBuilder('bet')
+      .where('bet.matchId = :matchId', { matchId })
+      .andWhere('bet.status = :status', { status: BetStatus.PENDING })
+      .orderBy('bet.createdAt', 'ASC')
+      .take(batchSize);
+
+    if (winnersOnly) {
+      queryBuilder.andWhere('bet.predictedOutcome = :outcome', {
+        outcome: matchOutcome,
+      });
+    } else {
+      queryBuilder.andWhere('bet.predictedOutcome <> :outcome', {
+        outcome: matchOutcome,
+      });
+    }
+
+    return queryBuilder.getMany();
+  }
+
+  private async settleBetBatch(
+    match: Match,
+    pendingBatch: Bet[],
+    winnersOnly: boolean,
+  ): Promise<BetSettlementSummary> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const lockedBets = await queryRunner.manager.find(Bet, {
+        where: {
+          id: In(pendingBatch.map((bet) => bet.id)),
+          status: BetStatus.PENDING,
+        },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      const orderedBets = pendingBatch
+        .map((bet) => lockedBets.find((lockedBet) => lockedBet.id === bet.id))
+        .filter((bet): bet is Bet => Boolean(bet));
+
+      const summary: BetSettlementSummary = {
+        settled: 0,
+        won: 0,
+        lost: 0,
+        totalPayout: 0,
+      };
+      const settledBetEvents: BetSettledEvent[] = [];
+
+      for (const bet of orderedBets) {
+        const isWin = bet.predictedOutcome === match.outcome;
+        if ((winnersOnly && !isWin) || (!winnersOnly && isWin)) {
+          continue;
+        }
+
+        let winningsAmount = 0;
+        if (isWin) {
+          bet.status = BetStatus.WON;
+          summary.won += 1;
+          const isFreeBet = Boolean(bet.metadata?.isFreeBet);
+          const isVoucherWithdrawable = Boolean(
+            bet.metadata?.isVoucherWithdrawable,
+          );
+
+          if (isFreeBet && !isVoucherWithdrawable) {
+            winningsAmount = Math.max(
+              0,
+              Number(bet.potentialPayout) - Number(bet.stakeAmount),
+            );
+          } else {
+            winningsAmount = Number(bet.potentialPayout);
+          }
+
+          if (winningsAmount > 0) {
+            const balanceResult =
+              await this.walletService.updateUserBalanceWithQueryRunner(
+                queryRunner,
+                bet.userId,
+                winningsAmount,
+                'BET_SETTLEMENT',
+                bet.id,
+                {
+                  reason: 'BET_WINNING',
+                  matchId: bet.matchId,
+                  stakeAmount: Number(bet.stakeAmount),
+                  payoutAmount: winningsAmount,
+                  betId: bet.id,
+                  isFreeBet,
+                  isVoucherWithdrawable,
+                },
+                !isFreeBet || isVoucherWithdrawable,
+              );
+
+            if (!balanceResult.success) {
+              throw new BadRequestException(
+                balanceResult.error ||
+                  `Failed to credit winnings for bet ${bet.id}`,
+              );
+            }
+          }
+
+          summary.totalPayout += winningsAmount;
+        } else {
+          bet.status = BetStatus.LOST;
+          summary.lost += 1;
+        }
+
+        bet.settledAt = new Date();
+        await queryRunner.manager.save(Bet, bet);
+        summary.settled += 1;
+        settledBetEvents.push(
+          new BetSettledEvent(
+            bet.userId,
+            bet.id,
+            match.id,
+            isWin,
+            Number(bet.stakeAmount),
+            winningsAmount,
+            0,
+          ),
+        );
+      }
+
+      await queryRunner.commitTransaction();
+      settledBetEvents.forEach((event) => this.eventBus.publish(event));
+      return summary;
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;

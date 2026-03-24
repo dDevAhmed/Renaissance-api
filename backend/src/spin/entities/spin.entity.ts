@@ -1,11 +1,5 @@
-import {
-  Entity,
-  PrimaryGeneratedColumn,
-  Column,
-  CreateDateColumn,
-  UpdateDateColumn,
-  Index,
-} from 'typeorm';
+import { Entity, Column, Index } from 'typeorm';
+import { BaseEntity } from '../../common/entities/base.entity';
 
 export enum SpinStatus {
   PENDING = 'pending',
@@ -24,10 +18,7 @@ export enum SpinOutcome {
 @Entity('spins')
 @Index(['userId', 'createdAt'])
 @Index(['sessionId'], { unique: true })
-export class Spin {
-  @PrimaryGeneratedColumn('uuid')
-  id: string;
-
+export class Spin extends BaseEntity {
   @Column('uuid')
   @Index()
   userId: string;
@@ -53,11 +44,10 @@ export class Spin {
     weightedProbabilities?: Record<string, number>;
     clientTimestamp?: Date;
     serverTimestamp?: Date;
+    rewardChannel?: 'XLM' | 'NFT' | 'FREE_BET';
+    voucherId?: string;
+    [key: string]: any;
   };
 
-  @CreateDateColumn()
-  createdAt: Date;
-
-  @UpdateDateColumn()
-  updatedAt: Date;
+  // ...BaseEntity fields: id, createdAt, updatedAt, deletedAt
 }

@@ -4,6 +4,7 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
+import { EventBus } from '@nestjs/cqrs';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { User } from '../users/entities/user.entity';
@@ -15,6 +16,10 @@ import {
 import { StakingContractService } from './services/staking-contract.service';
 import { RewardCalculatorService } from './services/reward-calculator.service';
 import { RewardDistributorService } from './services/reward-distributor.service';
+import {
+  StakeCreditedEvent,
+  StakeDebitedEvent,
+} from '../leaderboard/domain/events';
 
 export interface StakeResult {
   success: boolean;
@@ -45,6 +50,12 @@ export class StakingService {
     private readonly contract: StakingContractService,
     private readonly calculator: RewardCalculatorService,
     private readonly distributor: RewardDistributorService,
+    @InjectRepository(User)
+    private readonly userRepository: Repository<User>,
+    @InjectRepository(Transaction)
+    private readonly transactionRepository: Repository<Transaction>,
+    private readonly dataSource: DataSource,
+    private readonly eventBus: EventBus,
   ) {}
 
 
@@ -138,6 +149,11 @@ export class StakingService {
       endDate.setDate(endDate.getDate() + this.config.durationDays);
 
       await queryRunner.commitTransaction();
+
+      // Emit StakeDebitedEvent for leaderboard updates (staking locks/debits funds)
+      this.eventBus.publish(
+        new StakeDebitedEvent(userId, Number(amount), 'stake'),
+      );
 
       return {
         success: true,
@@ -236,6 +252,15 @@ export class StakingService {
       await queryRunner.manager.save(stakeTransaction);
 
       await queryRunner.commitTransaction();
+
+      // Emit StakeCreditedEvent for leaderboard updates
+      this.eventBus.publish(
+        new StakeCreditedEvent(
+          userId,
+          Number(stakedAmount),
+          Number(rewardAmount),
+        ),
+      );
 
       return {
         success: true,
