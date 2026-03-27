@@ -122,11 +122,6 @@ import { RateLimitGuard } from './common/guards/rate-limit.guard';
       NFTPlayerCard,
       Team,
       Player,
-<<<<<<< feat-player-search-statistics
-
-=======
-main
->>>>>>> main
     ]),
     SpinGameModule,
     RateLimitModule,
@@ -158,10 +153,9 @@ main
     FraudModule,
     TeamsModule,
     PlayersModule,
-<<<<<<< feat-player-search-statistics
-=======
+
     RankingModule,
->>>>>>> main
+
 
   ],
   providers: [
