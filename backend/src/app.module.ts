@@ -55,12 +55,14 @@ import { GamificationModule } from './gamification/gamification.module';
 import { Achievement } from './gamification/entities/achievement.entity';
 import { UserAchievement } from './gamification/entities/user-achievement.entity';
 import { Team } from './teams/entities/team.entity';
+
 import { Player } from './players/entities/player.entity';
 import { WebhookModule } from './webhooks/webhook.module';
 import { FraudModule } from './fraud/fraud.module';
 import { TeamsModule } from './teams/teams.module';
 import { PlayersModule } from './players/players.module';
 import { RankingModule } from './leaderboard/ranking.module';
+
 
 // Custom role-based guard
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
@@ -112,6 +114,7 @@ import { RateLimitGuard } from './common/guards/rate-limit.guard';
       UserAchievement,
       Team,
       Player,
+main
     ]),
     SpinGameModule,
     RateLimitModule,
@@ -143,6 +146,7 @@ import { RateLimitGuard } from './common/guards/rate-limit.guard';
     TeamsModule,
     PlayersModule,
     RankingModule,
+
   ],
   providers: [
     {
